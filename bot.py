@@ -10,6 +10,7 @@ from transformers import GPT2LMHeadModel, GPT2Tokenizer,GPT2Model
 import torch
 import logging
 from transformers import pipeline
+from groq import Groq
 
 print(torch.__version__)
 
@@ -30,14 +31,13 @@ print(os.environ['SIGNING_SECRET'])
 client = slack.WebClient(token=os.environ['SLACK_TOKEN'])
 BOT_ID = client.api_call("auth.test")['user_id']
 
+Grok_client = Groq(
+    api_key=os.environ.get("GROQ_API_KEY"),
+)
+
+
 message_counts = {}
 welcome_messages = {}
-
-def generate_response(message):
-    inputs = tokenizer.encode(message, return_tensors="pt", truncation=True, max_length=50)
-    outputs = model.generate(inputs, max_length=100, temperature=0.7)
-    response = tokenizer.decode(torch.argmax(outputs[0], dim=-1), skip_special_tokens=True)
-    return response
 
 BAD_WORDS = ['hmm', 'no', 'tim']
 
@@ -112,37 +112,10 @@ def send_welcome_message(channel, user):
 
     welcome = WelcomeMessage(channel)
     message = welcome.get_message()
-    response = client.chat_postMessage(**message)
-    welcome.timestamp = response['ts']
 
     welcome_messages[channel][user] = welcome
 
-def list_scheduled_messages(channel):
-    response = client.chat_scheduledMessages_list(channel=channel)
-    messages = response.data.get('scheduled_messages')
-    ids = []
-    for msg in messages:
-        ids.append(msg.get('id'))
 
-    return ids
-
-def schedule_messages(messages):
-    ids = []
-    for msg in messages:
-        response = client.chat_scheduledMessages_list(
-            channel=msg['channel'], text=msg['text'], post_at=msg['post_at']).data
-        id_ = response.get('scheduled_message_id')
-        ids.append(id_)
-
-    return ids
-
-def delete_scheduled_messages(ids, channel):
-    for _id in ids:
-        try:
-            client.chat_deleteScheduledMessage(
-                channel=channel, scheduled_message_id=_id)
-        except Exception as e:
-            print(e)
 
 def check_if_bad_words(message):
     msg = message.lower()
@@ -152,31 +125,6 @@ def check_if_bad_words(message):
 
 
 
-def respond_to_greeting(message):
-    message_lower = message.lower()
-    greetings = ['hello', 'hi', 'hey']
-    for greet in greetings:
-        if greet in message_lower:
-            return 'Hello! How can I help you today?'
-    return None
-
-
-def respond_to_arithmetic(message):
-    try:
-        result = eval(message.split('=')[-1].strip())
-        return f"The answer is {result}"
-    except Exception as e:
-        return None
-
-def return_messages(message):
-    message_lower = message.lower()
-    return_messages = ['okk', 'thank You','ok']
-    for message in return_messages:
-        if message in message_lower:
-            return '''It was lovely chatting with you,
-If you need anything or just want to chat, I'll be here'''
-    return None
-
 
 @slack_event_adapter.on('message')
 def message(payload):
@@ -184,28 +132,28 @@ def message(payload):
     channel_id = event.get('channel')
     user_id = event.get('user')
     text = event.get('text')
-    
-    response = None
 
-    response = respond_to_greeting(text)
-    if not response:
-        response = respond_to_arithmetic(text)
-    response = return_messages(text) or response
+    # Ignore messages sent by the bot itself
+    if user_id == BOT_ID:
+        return Response(), 200
 
-    if user_id != None and BOT_ID != user_id:
-        client.chat_postMessage(channel=channel_id, text=response)
-        
-        if user_id in message_counts:
-            message_counts[user_id] += 1
-        else:
-            message_counts[user_id] = 1
+    try:
+        chat_completion = Grok_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": text,
+                }
+            ],
+            model="llama3-8b-8192",
+            stream= False
+        )
+        result = chat_completion.choices[0].message.content
+        client.chat_postMessage(channel=channel_id, text=result)
+    except Exception as e:
+        print(f"Error: {e}")
+    return Response(), 200
 
-        if text.lower() == 'start':
-            send_welcome_message(f'@{user_id}', user_id)
-        elif check_if_bad_words(text):
-            ts = event.get('ts')
-            client.chat_postMessage(
-                channel=channel_id, thread_ts=ts, text="THAT IS A BAD WORD!")
 
 @slack_event_adapter.on('reaction_added')
 def reaction(payload):
@@ -219,7 +167,7 @@ def reaction(payload):
     welcome = welcome_messages[f'@{user_id}'][user_id]
     welcome.completed = True
     welcome.channel = channel_id
-    message = welcome.get_message()
+    message = welcome.get_message() 
     updated_message = client.chat_update(**message)
     welcome.timestamp = updated_message['ts']
 
@@ -256,7 +204,4 @@ def message_count():
     return Response(), 200
 
 if __name__ == "__main__":
-    schedule_messages(SCHEDULED_MESSAGES)
-    ids = list_scheduled_messages('C01BXQNT598')
-    delete_scheduled_messages(ids, 'C01BXQNT598')
     app.run(debug=True)
